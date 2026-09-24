@@ -25,7 +25,12 @@ class SelectiveRepeat:
     def send(self, data):
         if self.next_seq_num < self.base + self.window_size:
             packet = self.create_packet(data)
-            print(f"Sending packet {packet['seq_num']}: {packet['data']}")
+
+            print(
+                f"Sending packet {packet['seq_num']}: "
+                f"{packet['data']}"
+            )
+
             return packet
 
         print("Window is full. Cannot send new packet.")
@@ -46,5 +51,19 @@ class SelectiveRepeat:
 
     def retransmit(self):
         for seq_num, packet in self.unacked_packets.items():
-            print(f"Retransmitting packet {seq_num}: {packet['data']}")
-            
+            print(
+                f"Retransmitting packet {seq_num}: "
+                f"{packet['data']}"
+            )
+
+
+if __name__ == "__main__":
+    sr = SelectiveRepeat(window_size=4)
+
+    sr.send("Packet A")
+    sr.send("Packet B")
+    sr.send("Packet C")
+
+    sr.receive_ack(1)
+
+    sr.retransmit()
