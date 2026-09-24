@@ -57,13 +57,69 @@ class SelectiveRepeat:
             )
 
 
+class SelectiveRepeatReceiver:
+    def __init__(self, window_size=4):
+        self.window_size = window_size
+        self.base = 0
+        self.buffer = {}
+
+    def receive_packet(self, packet):
+        seq_num = packet["seq_num"]
+
+        if self.base <= seq_num < self.base + self.window_size:
+
+            if seq_num not in self.buffer:
+                self.buffer[seq_num] = packet
+                print(
+                    f"Received packet {seq_num}: "
+                    f"{packet['data']}"
+                )
+
+            print(f"ACK sent for packet {seq_num}")
+
+            self.deliver_packets()
+
+            return seq_num
+
+        print(f"Packet {seq_num} is outside the receiver window")
+        return None
+
+    def deliver_packets(self):
+        while self.base in self.buffer:
+            packet = self.buffer.pop(self.base)
+
+            print(
+                f"Delivered packet {packet['seq_num']}: "
+                f"{packet['data']}"
+            )
+
+            self.base += 1
+
+
 if __name__ == "__main__":
-    sr = SelectiveRepeat(window_size=4)
+    sender = SelectiveRepeat(window_size=4)
 
-    sr.send("Packet A")
-    sr.send("Packet B")
-    sr.send("Packet C")
+    sender.send("Packet A")
+    sender.send("Packet B")
+    sender.send("Packet C")
 
-    sr.receive_ack(1)
+    sender.receive_ack(1)
 
-    sr.retransmit()
+    sender.retransmit()
+
+    receiver = SelectiveRepeatReceiver(window_size=4)
+
+    receiver.receive_packet({
+        "seq_num": 0,
+        "data": "Packet A"
+    })
+
+    receiver.receive_packet({
+        "seq_num": 2,
+        "data": "Packet C"
+    })
+
+    receiver.receive_packet({
+        "seq_num": 1,
+        "data": "Packet B"
+    })
