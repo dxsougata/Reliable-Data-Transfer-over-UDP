@@ -1,1 +1,1 @@
-abcde
+def calculate_checksum(data):

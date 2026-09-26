@@ -1,3 +1,5 @@
+import time
+
 class SelectiveRepeat:
     def __init__(self, window_size=4, timeout=1.0):
         self.window_size = window_size
@@ -16,7 +18,7 @@ class SelectiveRepeat:
         }
 
         self.unacked_packets[self.next_seq_num] = packet
-        self.timers[self.next_seq_num] = None
+        self.timers[self.next_seq_num] = time.time()
 
         self.next_seq_num += 1
 
@@ -50,11 +52,18 @@ class SelectiveRepeat:
                 self.base += 1
 
     def retransmit(self):
-        for seq_num, packet in self.unacked_packets.items():
-            print(
-                f"Retransmitting packet {seq_num}: "
-                f"{packet['data']}"
-            )
+        current_time = time.time()
+
+        for seq_num, packet in list(self.unacked_packets.items()):
+            elapsed_time = current_time - self.timers[seq_num]
+
+            if elapsed_time >= self.timeout:
+                print(
+                f"Timeout for packet {seq_num}. "
+                f"Retransmitting: {packet['data']}"
+                )
+
+            self.timers[seq_num] = time.time()
 
 
 class SelectiveRepeatReceiver:
@@ -97,13 +106,15 @@ class SelectiveRepeatReceiver:
 
 
 if __name__ == "__main__":
-    sender = SelectiveRepeat(window_size=4)
+    sender = SelectiveRepeat(window_size=4, timeout=0.1)
 
     sender.send("Packet A")
     sender.send("Packet B")
     sender.send("Packet C")
 
     sender.receive_ack(1)
+
+    time.sleep(0.2)
 
     sender.retransmit()
 
