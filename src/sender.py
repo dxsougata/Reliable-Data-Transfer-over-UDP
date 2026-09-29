@@ -130,11 +130,12 @@ def main():
 
     try:
 
-        message = input(
-            "Enter message to send: "
-        )
+        file_path = input(
+        "Enter path of text file: "
+)
 
-        data = message.encode()
+        with open(file_path, "rb") as file:
+            data = file.read()
 
         # Split data into chunks
         chunks = [

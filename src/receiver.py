@@ -77,7 +77,7 @@ def main():
 
     expected_sequence = 0
 
-    received_data = bytearray()
+    output_file = open("received_file.txt", "wb")
 
     try:
 
@@ -103,7 +103,8 @@ def main():
 
             if seq_num == expected_sequence:
 
-                received_data.extend(data)
+                output_file.write(data)
+                output_file.flush()
 
                 print(
                     f"[RECEIVER] Accepted "
@@ -177,13 +178,11 @@ def main():
 
         print(
             "[RECEIVER] Final data:",
-            received_data.decode(
-                errors="replace"
             )
-        )
+        
 
     finally:
-
+        output_file.close()
         sock.close()
 
 
