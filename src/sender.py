@@ -1,168 +1,47 @@
+"""Command-line sender with selectable Stop-and-Wait and Go-Back-N ARQ."""
+
 import socket
-import time
-import struct
 
-# ============================================================
-# Configuration
-# ============================================================
+from common.config import CHANNEL_HOST, CHANNEL_PORT
+from protocols.go_back_n import GoBackNSender, TransferFailed as GoBackNTransferFailed
+from protocols.selective_repeat import SelectiveRepeatSender, TransferFailed as SelectiveRepeatTransferFailed
+from protocols.stop_and_wait import StopAndWaitSender, TransferFailed as StopAndWaitTransferFailed
 
-CHANNEL_HOST = "127.0.0.1"
-CHANNEL_PORT = 9001
-
-TIMEOUT = 1.0
-
-DATA_SIZE = 1024
-
-
-# ============================================================
-# Packet creation
-# ============================================================
-
-def create_packet(seq_num, data):
-    """
-    Packet format:
-
-    4 bytes  -> sequence number
-    4 bytes  -> data length
-    N bytes  -> data
-    """
-
-    header = struct.pack("!II", seq_num, len(data))
-
-    return header + data
-
-
-# ============================================================
-# ACK parsing
-# ============================================================
-
-def parse_ack(packet):
-    """
-    ACK format:
-
-    4 bytes -> ACK sequence number
-    """
-
-    if len(packet) != 4:
-        return None
-
-    ack_num = struct.unpack("!I", packet)[0]
-
-    return ack_num
-
-
-# ============================================================
-# Send one packet reliably
-# ============================================================
-
-def send_packet(sock, packet, seq_num):
-
-    while True:
-
-        print(f"[SENDER] Sending packet SEQ={seq_num}")
-
-        sock.sendto(
-            packet,
-            (CHANNEL_HOST, CHANNEL_PORT)
-        )
-
-        start_time = time.monotonic()
-
-        while True:
-
-            remaining = TIMEOUT - (
-                time.monotonic() - start_time
-            )
-
-            if remaining <= 0:
-
-                print(
-                    f"[SENDER] Timeout SEQ={seq_num}"
-                )
-
-                break
-
-            sock.settimeout(remaining)
-
-            try:
-
-                ack_packet, address = sock.recvfrom(1024)
-
-                ack_num = parse_ack(ack_packet)
-
-                if ack_num is None:
-                    continue
-
-                print(
-                    f"[SENDER] Received ACK={ack_num}"
-                )
-
-                if ack_num == seq_num:
-
-                    print(
-                        f"[SENDER] Packet SEQ={seq_num} "
-                        f"successfully delivered"
-                    )
-
-                    return
-
-            except socket.timeout:
-
-                print(
-                    f"[SENDER] Timeout SEQ={seq_num}"
-                )
-
-                break
-
-
-# ============================================================
-# Main
-# ============================================================
 
 def main():
+    print("Select protocol:")
+    print("1. Stop-and-Wait")
+    print("2. Go-Back-N")
+    print("3. Selective Repeat")
+    choice = input("Enter 1, 2, or 3: ").strip()
+    if choice not in ("1", "2", "3"):
+        raise SystemExit("Invalid choice. Enter 1, 2, or 3.")
 
-    sock = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_DGRAM
-    )
+    filepath = input("Enter path of file: ").strip().strip('"')
+    sender_class = {
+        "1": StopAndWaitSender,
+        "2": GoBackNSender,
+        "3": SelectiveRepeatSender,
+    }[choice]
 
-    sequence_number = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sender = sender_class(sock, (CHANNEL_HOST, CHANNEL_PORT))
+        try:
+            stats = sender.send_file(filepath)
+        except (
+            OSError,
+            GoBackNTransferFailed,
+            StopAndWaitTransferFailed,
+            SelectiveRepeatTransferFailed,
+        ) as exc:
+            raise SystemExit(f"Transfer failed: {exc}") from exc
 
-    try:
-
-        file_path = input(
-        "Enter path of text file: "
-)
-
-        with open(file_path, "rb") as file:
-            data = file.read()
-
-        # Split data into chunks
-        chunks = [
-            data[i:i + DATA_SIZE]
-            for i in range(0, len(data), DATA_SIZE)
-        ]
-
-        for chunk in chunks:
-
-            packet = create_packet(
-                sequence_number,
-                chunk
-            )
-
-            send_packet(
-                sock,
-                packet,
-                sequence_number
-            )
-
-            sequence_number += 1
-
-        print("[SENDER] Transmission complete")
-
-    finally:
-
-        sock.close()
+    protocol_name = {
+        "1": "Stop-and-Wait",
+        "2": "Go-Back-N",
+        "3": "Selective Repeat",
+    }[choice]
+    print(f"[{protocol_name}] Transfer complete: {stats}")
 
 
 if __name__ == "__main__":

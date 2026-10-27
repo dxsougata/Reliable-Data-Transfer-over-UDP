@@ -45,7 +45,11 @@ from common.config import (
     MAX_RETRIES,
     UDP_RECV_BUFFER_SIZE,
     SEQ_MODULO,
+    MIN_RTO,
+    MAX_RTO,
+    RTO_CLOCK_GRANULARITY,
 )
+from rto import RtoEstimator
 
 
 class TransferFailed(Exception):
@@ -64,7 +68,12 @@ class GoBackNSender:
                  window_size=DEFAULT_WINDOW_SIZE, max_retries=MAX_RETRIES, on_event=None):
         self.sock = sock
         self.dest_addr = dest_addr
-        self.timeout = timeout
+        self.rto_estimator = RtoEstimator(
+            initial_rto=timeout,
+            min_rto=MIN_RTO,
+            max_rto=MAX_RTO,
+            clock_granularity=RTO_CLOCK_GRANULARITY,
+        )
         self.window_size = window_size
         self.max_retries = max_retries
         self.on_event = on_event or (lambda *a, **k: None)
@@ -80,19 +89,24 @@ class GoBackNSender:
         next_seq_num = 0     # index of next packet to send
         timer_deadline = None
         base_retry_count = 0
-
-        self.sock.settimeout(self.timeout)
+        first_sent_at = {}
+        retransmitted = set()
 
         while base < n:
             # Send everything the window currently allows.
             while next_seq_num < min(base + self.window_size, n):
+                first_sent_at[next_seq_num] = time.monotonic()
                 self.sock.sendto(packets[next_seq_num].pack(), self.dest_addr)
                 stats["packets_sent"] += 1
                 if timer_deadline is None:
-                    timer_deadline = time.monotonic() + self.timeout
+                    timer_deadline = time.monotonic() + self.rto_estimator.rto
                 next_seq_num += 1
 
-            remaining = timer_deadline - time.monotonic() if timer_deadline else self.timeout
+            remaining = (
+                timer_deadline - time.monotonic()
+                if timer_deadline
+                else self.rto_estimator.rto
+            )
             if remaining <= 0:
                 # Timeout: go back N -- resend the whole in-flight window.
                 base_retry_count += 1
@@ -102,11 +116,14 @@ class GoBackNSender:
                     )
                 self.on_event("timeout_retransmit_window", base=packets[base].seq_num,
                               count=next_seq_num - base)
+                self.rto_estimator.backoff()
+                self.on_event("rto_backoff", rto=self.rto_estimator.rto)
                 for i in range(base, next_seq_num):
+                    retransmitted.add(i)
                     self.sock.sendto(packets[i].pack(), self.dest_addr)
                     stats["packets_sent"] += 1
                     stats["retransmissions"] += 1
-                timer_deadline = time.monotonic() + self.timeout
+                timer_deadline = time.monotonic() + self.rto_estimator.rto
                 continue
 
             self.sock.settimeout(remaining)
@@ -127,11 +144,19 @@ class GoBackNSender:
             if offset >= in_flight:
                 continue  # duplicate / stale / not-yet-sent ack, ignore
 
+            acked_index = base + offset
+            if acked_index not in retransmitted:
+                self.rto_estimator.update(time.monotonic() - first_sent_at[acked_index])
+
             # Cumulative ACK: everything through this offset is confirmed.
             base += offset + 1
             base_retry_count = 0
             self.on_event("ack_received", seq=ack.seq_num, new_base=base)
-            timer_deadline = time.monotonic() + self.timeout if base < next_seq_num else None
+            timer_deadline = (
+                time.monotonic() + self.rto_estimator.rto
+                if base < next_seq_num
+                else None
+            )
 
         return stats
 
@@ -155,12 +180,18 @@ class GoBackNSender:
 
         start_payload = make_start_payload(len(chunks), bytes.fromhex(file_hash(file_data)))
         packets = [Packet(PacketType.START, 0, start_payload)]
-        packets += [Packet(PacketType.DATA, i + 1, chunk) for i, chunk in enumerate(chunks)]
-        packets.append(Packet(PacketType.END, len(chunks) + 1, b""))
+        packets += [
+            Packet(PacketType.DATA, (i + 1) % SEQ_MODULO, chunk)
+            for i, chunk in enumerate(chunks)
+        ]
+        packets.append(Packet(PacketType.END, (len(chunks) + 1) % SEQ_MODULO, b""))
 
         self._send_window(packets, stats)
 
         stats["elapsed_sec"] = time.monotonic() - start_time
+        stats["rto_final_sec"] = self.rto_estimator.rto
+        stats["rtt_samples"] = self.rto_estimator.samples
+        stats["srtt_sec"] = self.rto_estimator.srtt
         stats["goodput_bps"] = (
             (stats["bytes_sent"] * 8) / stats["elapsed_sec"] if stats["elapsed_sec"] > 0 else 0
         )

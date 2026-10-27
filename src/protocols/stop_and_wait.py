@@ -1,24 +1,3 @@
-"""
-protocols/stop_and_wait.py
-
-Stop-and-Wait ARQ over UDP.
-
-    Sender:                          Receiver:
-    send packet N                    recv packet
-    start timer                      if valid and seq == expected:
-    wait for ACK N                       deliver, send ACK(seq), expected += 1
-      got ACK N       -> next packet   else:
-      timeout          -> resend N        send ACK(last correctly received)
-      got wrong/garbled ACK -> ignore, keep waiting (timer keeps running)
-
-Only one packet is ever in flight. A STOP-and-WAIT transfer is just:
-    START (metadata)  -- reliably delivered --
-    DATA 0, DATA 1, DATA 2, ...  -- each reliably delivered in turn --
-    END               -- reliably delivered --
-so the sender's core job is "reliably deliver one packet and get its ACK"
-repeated for every chunk; that single building block is `_send_reliable`.
-"""
-
 import socket
 import time
 
@@ -30,7 +9,11 @@ from common.config import (
     MAX_RETRIES,
     UDP_RECV_BUFFER_SIZE,
     SEQ_MODULO,
+    MIN_RTO,
+    MAX_RTO,
+    RTO_CLOCK_GRANULARITY,
 )
+from rto import RtoEstimator
 
 
 class TransferFailed(Exception):
@@ -50,26 +33,31 @@ class StopAndWaitSender:
         """
         self.sock = sock
         self.dest_addr = dest_addr
-        self.timeout = timeout
+        self.rto_estimator = RtoEstimator(
+            initial_rto=timeout,
+            min_rto=MIN_RTO,
+            max_rto=MAX_RTO,
+            clock_granularity=RTO_CLOCK_GRANULARITY,
+        )
         self.max_retries = max_retries
         self.on_event = on_event or (lambda *a, **k: None)
 
-    # -- core building block: reliably deliver ONE packet --------------------
 
     def _send_reliable(self, packet: Packet, stats: dict) -> None:
         """Send `packet` and block until the matching ACK arrives, resending
         on timeout. Raises TransferFailed if max_retries is exceeded."""
-        self.sock.settimeout(self.timeout)
         attempts = 0
 
         while attempts <= self.max_retries:
+            current_rto = self.rto_estimator.rto
+            sent_at = time.monotonic()
             self.sock.sendto(packet.pack(), self.dest_addr)
             stats["packets_sent"] += 1
             if attempts > 0:
                 stats["retransmissions"] += 1
                 self.on_event("retransmit", seq=packet.seq_num, attempt=attempts)
 
-            deadline = time.monotonic() + self.timeout
+            deadline = sent_at + current_rto
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -86,18 +74,19 @@ class StopAndWaitSender:
                     continue  # garbage on the wire, keep waiting
 
                 if ack.type == PacketType.ACK and ack.is_valid() and ack.seq_num == packet.seq_num:
+                    if attempts == 0:
+                        self.rto_estimator.update(time.monotonic() - sent_at)
                     self.on_event("ack_received", seq=ack.seq_num)
                     return  # success
 
-                # Wrong seq / corrupted ACK: ignore it and keep waiting for
-                # the real one -- this is stop-and-wait, so there is never a
-                # reason to give up early just because we saw a stale ACK.
 
+            self.rto_estimator.backoff()
+            self.on_event("rto_backoff", rto=self.rto_estimator.rto)
             attempts += 1
 
         raise TransferFailed(f"gave up on seq={packet.seq_num} after {self.max_retries} retries")
 
-    # -- public API ------------------------------------------------------------
+
 
     def send_file(self, filepath: str) -> dict:
         """Reliably transfer filepath to dest_addr. Returns a stats dict with
@@ -135,6 +124,9 @@ class StopAndWaitSender:
         self._send_reliable(Packet(PacketType.END, seq, b""), stats)
 
         stats["elapsed_sec"] = time.monotonic() - start_time
+        stats["rto_final_sec"] = self.rto_estimator.rto
+        stats["rtt_samples"] = self.rto_estimator.samples
+        stats["srtt_sec"] = self.rto_estimator.srtt
         stats["goodput_bps"] = (
             (stats["bytes_sent"] * 8) / stats["elapsed_sec"] if stats["elapsed_sec"] > 0 else 0
         )
