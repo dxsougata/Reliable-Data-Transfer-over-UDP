@@ -1,97 +1,119 @@
+"""Packet encoding shared by the Stop-and-Wait and Go-Back-N protocols."""
+
 import struct
-from src.common.checksum import calculate_checksum, verify_checksum
+import zlib
+from dataclasses import dataclass, field
+from enum import IntEnum
 
-DATA = 0
-ACK = 1
 
+class PacketError(ValueError):
+    """Raised when a datagram cannot be decoded as a protocol packet."""
+
+
+class PacketType(IntEnum):
+    START = 1
+    DATA = 2
+    END = 3
+    ACK = 4
+
+
+# Wire header: type (1 byte), sequence number (4), payload length (4),
+# CRC32 (4), followed by payload bytes.
+_HEADER_FORMAT = "!BIII"
+_HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)
+_CHECKSUM_HEADER_FORMAT = "!BII"
+
+
+@dataclass
 class Packet:
-    def __init__(self, packet_type, seq_num, data=b""):
-        self.packet_type = packet_type
-        self.seq_num = seq_num
+    type: PacketType
+    seq_num: int
+    payload: bytes = b""
+    _checksum: int | None = field(default=None, repr=False, compare=False)
 
-        if isinstance(data, str):
-            data = data.encode()
-
-        self.data = data
-
-    def serialize(self):
-        """
-        Convert Packet object into bytes for UDP transmission.
-        """
-
-        # Header:
-        # 1 byte  -> packet type
-        # 4 bytes -> sequence number
-        # 4 bytes -> data length
-        header = struct.pack(
-            "!BII",
-            self.packet_type,
+    def _checksum_bytes(self) -> bytes:
+        return struct.pack(
+            _CHECKSUM_HEADER_FORMAT,
+            int(self.type),
             self.seq_num,
-            len(self.data)
+            len(self.payload),
+        ) + self.payload
+
+    def pack(self) -> bytes:
+        checksum = zlib.crc32(self._checksum_bytes()) & 0xFFFFFFFF
+        return struct.pack(
+            _HEADER_FORMAT,
+            int(self.type),
+            self.seq_num,
+            len(self.payload),
+            checksum,
+        ) + self.payload
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "Packet":
+        if len(data) < _HEADER_SIZE:
+            raise PacketError("Packet is shorter than its header")
+
+        type_value, seq_num, payload_length, checksum = struct.unpack(
+            _HEADER_FORMAT, data[:_HEADER_SIZE]
         )
+        payload = data[_HEADER_SIZE:]
+        if len(payload) != payload_length:
+            raise PacketError("Payload length does not match the header")
 
-        checksum = calculate_checksum(header + self.data)
+        try:
+            packet_type = PacketType(type_value)
+        except ValueError as exc:
+            raise PacketError(f"Unknown packet type: {type_value}") from exc
 
-        packet = struct.pack("!I", checksum)
-        packet += header
-        packet += self.data
+        return cls(packet_type, seq_num, payload, checksum)
 
-        return packet
+    def is_valid(self) -> bool:
+        expected = zlib.crc32(self._checksum_bytes()) & 0xFFFFFFFF
+        return self._checksum is not None and self._checksum == expected
+
+    @property
+    def data(self) -> bytes:
+        return self.payload
+
+    @property
+    def packet_type(self) -> int:
+        return int(self.type)
+
+    def serialize(self) -> bytes:
+        return self.pack()
 
     @staticmethod
-    def deserialize(packet_bytes):
-        """
-        Convert received bytes back into a Packet object.
-        """
+    def deserialize(packet_bytes: bytes) -> "Packet":
+        return Packet.unpack(packet_bytes)
 
-        # Minimum packet size:
-        # 4 bytes checksum
-        # 1 byte packet type
-        # 4 bytes sequence number
-        # 4 bytes data length
-        if len(packet_bytes) < 13:
-            raise ValueError("Invalid packet")
+    def is_data(self) -> bool:
+        return self.type == PacketType.DATA
 
-        received_checksum = struct.unpack(
-            "!I",
-            packet_bytes[:4]
-        )[0]
-
-        packet_type, seq_num, data_length = struct.unpack(
-            "!BII",
-            packet_bytes[4:13]
-        )
-
-        data = packet_bytes[13:13 + data_length]
-
-        if not verify_checksum(
-            packet_bytes[4:13] + data,
-            received_checksum
-        ):
-            raise ValueError("Checksum verification failed")
-
-        return Packet(
-            packet_type,
-            seq_num,
-            data
-        )
-
-    def is_data(self):
-        return self.packet_type == DATA
-
-    def is_ack(self):
-        return self.packet_type == ACK
+    def is_ack(self) -> bool:
+        return self.type == PacketType.ACK
 
 
-def create_data_packet(seq_num, data):
-    """
-    Create a DATA packet.
-    """
-    return Packet(DATA, seq_num, data)
+def create_data_packet(seq_num: int, data: bytes | str) -> Packet:
+    if isinstance(data, str):
+        data = data.encode()
+    return Packet(PacketType.DATA, seq_num, data)
 
 
-def create_ack_packet(seq_num):
-    """
-    Create an ACK packet.
-    """
-    return Packet(ACK, seq_num)
+def create_ack_packet(seq_num: int) -> Packet:
+    return Packet(PacketType.ACK, seq_num)
+
+
+def make_start_payload(total_chunks: int, file_hash: bytes) -> bytes:
+    """Encode a 32-bit chunk count followed by a SHA-256 digest."""
+    if not 0 <= total_chunks <= 0xFFFFFFFF:
+        raise ValueError("total_chunks must fit in an unsigned 32-bit integer")
+    if len(file_hash) != 32:
+        raise ValueError("file_hash must be a 32-byte SHA-256 digest")
+    return struct.pack("!I", total_chunks) + file_hash
+
+
+def parse_start_payload(payload: bytes) -> tuple[int, bytes]:
+    if len(payload) != 36:
+        raise PacketError("Invalid START payload")
+    return struct.unpack("!I", payload[:4])[0], payload[4:]
