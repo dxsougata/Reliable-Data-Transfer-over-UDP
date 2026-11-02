@@ -1,32 +1,3 @@
-"""
-protocols/go_back_n.py
-
-Go-Back-N ARQ over UDP: the sender may have up to `window_size` packets
-in flight at once instead of waiting for each ACK individually.
-
-    base                                  next_seq_num
-     |                                          |
-    [sent+acked][ sent, waiting for ACK  ][ not yet sent ]
-                 <----- window_size ----->
-
-  - Receiver only accepts packets that arrive strictly in order. Anything
-    out of order (or corrupted) is dropped, and the receiver re-sends the
-    ACK for the last packet it *did* accept in order (a cumulative ACK).
-  - Sender keeps ONE timer, for the oldest unacked packet (`base`). If it
-    fires, the sender resends every packet currently in flight
-    (base .. next_seq_num-1), not just the oldest one -- that's the
-    defining "go back N" behaviour.
-  - An ACK for seq N is cumulative: it means "everything up to and
-    including N has been received correctly", so receiving it slides
-    `base` forward past N.
-
-Sequence numbers here are just "packet index in this transfer" taken
-modulo SEQ_MODULO (see common/config.py). Because SEQ_MODULO (65536) is
-always far larger than any reasonable window_size, converting an
-incoming ACK's sequence number back into a window position is done with
-modular offset arithmetic (see `_ack_offset`).
-"""
-
 import socket
 import time
 
@@ -53,13 +24,10 @@ from rto import RtoEstimator
 
 
 class TransferFailed(Exception):
-    """Raised when the window's base packet could not be delivered within
-    max_retries full-window retransmissions."""
+    pass
 
 
 def _ack_offset(ack_seq: int, base_seq: int) -> int:
-    """How many positions past base_seq does ack_seq sit, under modular
-    sequence-number arithmetic? (0 means "ack_seq == base_seq".)"""
     return (ack_seq - base_seq) % SEQ_MODULO
 
 
@@ -79,11 +47,6 @@ class GoBackNSender:
         self.on_event = on_event or (lambda *a, **k: None)
 
     def _send_window(self, packets: list, stats: dict) -> dict:
-        """
-        Reliably deliver every packet in `packets` (already in final
-        transfer order -- START, DATA..., END) using a sliding window.
-        Returns the stats dict, updated in place.
-        """
         n = len(packets)
         base = 0            # index of oldest unacked packet
         next_seq_num = 0     # index of next packet to send
