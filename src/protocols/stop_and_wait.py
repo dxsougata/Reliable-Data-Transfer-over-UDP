@@ -17,20 +17,12 @@ from rto import RtoEstimator
 
 
 class TransferFailed(Exception):
-    """Raised when a packet could not be delivered within MAX_RETRIES."""
+    pass
 
 
 class StopAndWaitSender:
     def __init__(self, sock: socket.socket, dest_addr, timeout=DEFAULT_TIMEOUT,
                  max_retries=MAX_RETRIES, on_event=None):
-        """
-        sock:        an already-created UDP socket (not bound to anything
-                     in particular). This class will call settimeout() on it.
-        dest_addr:   (host, port) tuple of the receiver.
-        on_event:    optional callback on_event(name: str, **info) used for
-                     logging / experiment metrics (e.g. "retransmit", "ack").
-                     Safe to leave as None.
-        """
         self.sock = sock
         self.dest_addr = dest_addr
         self.rto_estimator = RtoEstimator(
@@ -44,8 +36,6 @@ class StopAndWaitSender:
 
 
     def _send_reliable(self, packet: Packet, stats: dict) -> None:
-        """Send `packet` and block until the matching ACK arrives, resending
-        on timeout. Raises TransferFailed if max_retries is exceeded."""
         attempts = 0
 
         while attempts <= self.max_retries:
@@ -61,7 +51,7 @@ class StopAndWaitSender:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    break  # fall through to outer retransmit
+                    break
                 self.sock.settimeout(remaining)
                 try:
                     data, _ = self.sock.recvfrom(UDP_RECV_BUFFER_SIZE)
@@ -71,13 +61,13 @@ class StopAndWaitSender:
                 try:
                     ack = Packet.unpack(data)
                 except PacketError:
-                    continue  # garbage on the wire, keep waiting
+                    continue
 
                 if ack.type == PacketType.ACK and ack.is_valid() and ack.seq_num == packet.seq_num:
                     if attempts == 0:
                         self.rto_estimator.update(time.monotonic() - sent_at)
                     self.on_event("ack_received", seq=ack.seq_num)
-                    return  # success
+                    return
 
 
             self.rto_estimator.backoff()
@@ -89,15 +79,13 @@ class StopAndWaitSender:
 
 
     def send_file(self, filepath: str) -> dict:
-        """Reliably transfer filepath to dest_addr. Returns a stats dict with
-        packets_sent, retransmissions, bytes_sent, chunks_sent, elapsed_sec."""
         with open(filepath, "rb") as f:
             file_data = f.read()
 
         chunks = [
             file_data[i:i + MAX_PAYLOAD_SIZE]
             for i in range(0, len(file_data), MAX_PAYLOAD_SIZE)
-        ] or [b""]  # handle empty file: still send one (empty) chunk
+        ] or [b""]
 
         stats = {
             "packets_sent": 0,
@@ -109,18 +97,14 @@ class StopAndWaitSender:
         start_time = time.monotonic()
         seq = 0
 
-        # 1. START: tell the receiver how many chunks are coming and the
-        #    expected final hash, so it can verify the reassembled file.
         start_payload = make_start_payload(len(chunks), bytes.fromhex(file_hash(file_data)))
         self._send_reliable(Packet(PacketType.START, seq, start_payload), stats)
         seq = (seq + 1) % SEQ_MODULO
 
-        # 2. DATA packets, one at a time, each fully acked before the next.
         for chunk in chunks:
             self._send_reliable(Packet(PacketType.DATA, seq, chunk), stats)
             seq = (seq + 1) % SEQ_MODULO
 
-        # 3. END: signals the receiver the transfer is complete.
         self._send_reliable(Packet(PacketType.END, seq, b""), stats)
 
         stats["elapsed_sec"] = time.monotonic() - start_time
@@ -135,16 +119,10 @@ class StopAndWaitSender:
 
 class StopAndWaitReceiver:
     def __init__(self, sock: socket.socket, on_event=None):
-        """sock must already be bound (e.g. sock.bind((host, port)))."""
         self.sock = sock
         self.on_event = on_event or (lambda *a, **k: None)
 
     def receive_file(self, save_path: str) -> dict:
-        """
-        Block until a full file has been reliably received, write it to
-        save_path, and return a stats dict including whether the SHA-256
-        hash sent by the sender matched the reassembled file.
-        """
         expected_seq = 0
         received_chunks = []
         total_chunks = None
@@ -153,7 +131,7 @@ class StopAndWaitReceiver:
 
         stats = {"packets_received": 0, "duplicates_discarded": 0, "corrupted_discarded": 0}
 
-        self.sock.settimeout(None)  # receiver blocks indefinitely between packets
+        self.sock.settimeout(None)
         while True:
             data, addr = self.sock.recvfrom(UDP_RECV_BUFFER_SIZE)
             if sender_addr is None:
@@ -162,28 +140,21 @@ class StopAndWaitReceiver:
             try:
                 pkt = Packet.unpack(data)
             except PacketError:
-                continue  # not even a parseable packet, drop silently
+                continue
 
             if not pkt.is_valid():
                 stats["corrupted_discarded"] += 1
                 self.on_event("corrupted", seq=pkt.seq_num)
-                # Can't trust pkt.seq_num either (header may be corrupt), so
-                # we simply don't ACK; the sender's timer will retransmit.
                 continue
 
             stats["packets_received"] += 1
 
             if pkt.seq_num != expected_seq:
-                # Either a duplicate of something we already have (sender's
-                # ACK to us was lost) or, in theory, out of order -- either
-                # way in Stop-and-Wait the fix is the same: re-ACK the last
-                # packet we *did* accept so the sender's timer clears.
                 stats["duplicates_discarded"] += 1
                 last_good = (expected_seq - 1) % SEQ_MODULO
                 self.sock.sendto(Packet(PacketType.ACK, last_good).pack(), sender_addr)
                 continue
 
-            # In-order, valid packet -> accept it.
             self.sock.sendto(Packet(PacketType.ACK, pkt.seq_num).pack(), sender_addr)
             expected_seq = (expected_seq + 1) % SEQ_MODULO
 
