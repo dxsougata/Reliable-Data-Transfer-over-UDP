@@ -13,8 +13,7 @@ Core protocol logic, state transitions, buffer data structures, and socket routi
 * **What we did manually:**
   * Defined packet types (`START`, `DATA`, `END`, `ACK`).
   * Designed the payload structure for `START` (chunk count + SHA-256 hash).
-  * Implemented serialization/deserialization and error handling in `src/common/packet.py`.
-
+  
 ---
 
 ## 2. Adrish Paul — Channel Emulator (`src/channel.py`)
@@ -48,14 +47,12 @@ Core protocol logic, state transitions, buffer data structures, and socket routi
 * **What I wrote myself:**
   * Individual ACK tracking for every packet in the sender window.
   * Selective Repeat receiver buffer to store out-of-order packets without discarding them.
-  * In-order commit loop: advancing the receiver window and writing consecutive buffered chunks to disk when earlier missing packets finally arrive.
-
+  
 ---
 
 ## 5. Sougata Kundu — Adaptive RTO & Experiments (`src/rto.py`, `experiments/`)
 * **What I consulted AI for:**
-  * **Formula Verification:** Checked the standard Jacobson/Karels smoothing equations ($\alpha = 0.125$, $\beta = 0.25$) and confirmed Karn's algorithm rules (ignoring RTT samples from retransmitted packets).
-  * **Boilerplate:** Syntax and styling templates for `matplotlib` to plot Goodput vs. Loss Rate and Window Size vs. Transfer Time.
-* **What I wrote myself:**
-  * `RtoEstimator` class implementing SRTT, RTTVAR, RTO clamping between `MIN_RTO` and `MAX_RTO`, and exponential backoff (`backoff()`).
-  * Experiment automation scripts to run transfers across varying loss rates and window sizes, logging performance metrics.
+  * **Formula Verification:** Checked the standard Karels smoothing equations and confirmed Karn's algorithm rules (ignoring RTT samples from retransmitted packets).
+ * **What I wrote myself:**
+  * `RtoEstimator` class implementing SRTT, RTTVAR, RTO clamping between `MIN_RTO` and `MAX_RTO`.
+  * Experiment automation scripts to run transfers across varying loss rates and window sizes.
