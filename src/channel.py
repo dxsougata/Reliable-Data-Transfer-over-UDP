@@ -63,6 +63,11 @@ class ChannelEmulator:
 
         self.listen_addr = (listen_host, listen_port)
         self.receiver_addr = (receiver_host, receiver_port)
+        try:
+            self.receiver_ip = socket.gethostbyname(receiver_host)
+        except OSError:
+            self.receiver_ip = receiver_host
+
         self.sender_addr = None
         self.rng = random.Random(self.config.seed)
 
@@ -94,7 +99,7 @@ class ChannelEmulator:
             d = self.rng.uniform(self.config.min_delay_ms, self.config.max_delay_ms) / 1000.0
             delay += d
             self.stats["delayed"] += 1
-            print(f"[CHANNEL] DELAY {d * 1000:.1f}ms")
+            print(f"[CHANNEL] DELAY {d * 1000:.1f}ms", flush=True)
 
         with self.cv:
             self.counter += 1
@@ -117,38 +122,59 @@ class ChannelEmulator:
             try:
                 self.sock.sendto(data, dest)
                 self.stats["forwarded"] += 1
-            except OSError:
-                pass
+                print(f"[CHANNEL] TX {len(data)}B -> {dest}", flush=True)
+            except Exception as e:
+                if self.running:
+                    print(f"[CHANNEL] FORWARD ERROR: {type(e)} {e}", flush=True)
 
     def _handle_packet(self, data: bytes, source: tuple):
-        if source == self.receiver_addr:
+        # Identify whether the packet came from Receiver or Sender
+        is_from_receiver = (
+            source[1] == self.receiver_addr[1]
+            and (source[0] == self.receiver_ip or source[0] in ("127.0.0.1", "localhost"))
+        )
+
+        if is_from_receiver:
             if not self.sender_addr:
+                print(f"[CHANNEL] RX {len(data)}B from Receiver, but Sender unknown (dropped)", flush=True)
                 return
             dest = self.sender_addr
+            direction = "RECEIVER -> SENDER"
         else:
-            self.sender_addr = source
+            if self.sender_addr != source:
+                self.sender_addr = source
+                print(f"[CHANNEL] Learned sender address: {self.sender_addr}", flush=True)
             dest = self.receiver_addr
+            direction = "SENDER -> RECEIVER"
+
+        pkt_info = ""
+        if len(data) >= 13:
+            import struct
+            t_val, s_val, l_val, _ = struct.unpack("!BIII", data[:13])
+            t_name = {1: "START", 2: "DATA", 3: "END", 4: "ACK"}.get(t_val, str(t_val))
+            pkt_info = f" ({t_name} seq={s_val})"
 
         self.stats["received"] += 1
+        print(f"[CHANNEL] RX {len(data)}B [{direction}]{pkt_info}", flush=True)
 
         # 1. Packet Loss
         if self.rng.random() < self.config.loss_probability:
             self.stats["dropped"] += 1
-            print(f"[CHANNEL] DROP ({len(data)}B)")
+            print(f"[CHANNEL] DROP ({len(data)}B) [{direction}]", flush=True)
             return
 
         # 2. Packet Corruption
         if self.rng.random() < self.config.corruption_probability:
             data = self._corrupt_packet(data)
             self.stats["corrupted"] += 1
-            print(f"[CHANNEL] CORRUPT ({len(data)}B)")
+            print(f"[CHANNEL] CORRUPT ({len(data)}B) [{direction}]", flush=True)
 
         # 3. Packet Reordering (extra delay)
         extra = 0.0
         if self.rng.random() < self.config.reorder_probability:
             extra = self.rng.uniform(self.config.reorder_min_delay_ms, self.config.reorder_max_delay_ms) / 1000.0
             self.stats["reordered"] += 1
-            print(f"[CHANNEL] REORDER (+{extra * 1000:.1f}ms)")
+            print(f"[CHANNEL] REORDER (+{extra * 1000:.1f}ms) [{direction}]", flush=True)
 
         # 4. Schedule Forwarding (+ normal delay)
         self._schedule_packet(data, dest, extra)
@@ -156,28 +182,45 @@ class ChannelEmulator:
         # 5. Packet Duplication
         if self.rng.random() < self.config.duplicate_probability:
             self.stats["duplicated"] += 1
-            print("[CHANNEL] DUPLICATE")
+            print(f"[CHANNEL] DUPLICATE [{direction}]", flush=True)
             self._schedule_packet(data, dest)
 
-    def _listen_worker(self):
+    def _listen_loop(self):
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(BUFFER_SIZE)
             except (socket.timeout, BlockingIOError):
                 continue
             except OSError:
+                if not self.running:
+                    break
+                continue
+            except Exception as e:
+                print(f"[CHANNEL] RECV LOOP CRASH: {type(e)} {e}", flush=True)
+                import traceback
+                traceback.print_exc()
                 break
-            self._handle_packet(data, addr)
+            try:
+                self._handle_packet(data, addr)
+            except Exception as e:
+                print(f"[CHANNEL] HANDLE PACKET CRASH: {type(e)} {e}", flush=True)
+                import traceback
+                traceback.print_exc()
 
-    def start(self):
+    def start(self, run_listener_thread: bool = False):
         if self.running:
             return
         self.running = True
-        threading.Thread(target=self._forward_worker, daemon=True).start()
-        threading.Thread(target=self._listen_worker, daemon=True).start()
-        print(f"[CHANNEL] Listening on {self.listen_addr} -> Receiver: {self.receiver_addr}")
+        self._forward_thread = threading.Thread(target=self._forward_worker, daemon=True)
+        self._forward_thread.start()
+        if run_listener_thread:
+            self._listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
+            self._listen_thread.start()
+        print(f"[CHANNEL] Listening on {self.listen_addr} -> Receiver: {self.receiver_addr}", flush=True)
 
     def stop(self):
+        if not self.running:
+            return
         self.running = False
         with self.cv:
             self.cv.notify_all()
@@ -185,18 +228,17 @@ class ChannelEmulator:
             self.sock.close()
         except OSError:
             pass
-        print("\n========== CHANNEL STATISTICS ==========")
+        print("\n========== CHANNEL STATISTICS ==========", flush=True)
         for k, v in self.stats.items():
-            print(f"  {k:<12}: {v}")
-        print("========================================")
+            print(f"  {k:<12}: {v}", flush=True)
+        print("========================================\n", flush=True)
 
     def run(self):
-        self.start()
+        self.start(run_listener_thread=False)
         try:
-            while self.running:
-                time.sleep(0.2)
+            self._listen_loop()
         except KeyboardInterrupt:
-            print("\n[CHANNEL] Shutdown requested.")
+            print("\n[CHANNEL] Shutdown requested.", flush=True)
         finally:
             self.stop()
 
